@@ -9,6 +9,8 @@ import sys
 import subprocess
 import os
 import platform
+import zipfile
+import re
 from pathlib import Path
 from openpyxl import load_workbook
 
@@ -48,6 +50,52 @@ def setup_libreoffice_macro():
         return True
     except Exception:
         return False
+
+
+def count_formulas(filename):
+    """
+    Count formulas in an Excel file by scanning XML directly.
+    Much faster than loading the workbook with openpyxl.
+    """
+    formula_count = 0
+    # Pattern matches <f> tag which indicates a formula.
+    # Matches <f> or <f ...> (with attributes) or <f/> (empty shared formula)
+    # Regex looks for <f followed by > or space or /
+    pattern = re.compile(rb'<f[>\s/]')
+
+    try:
+        with zipfile.ZipFile(filename, 'r') as z:
+            for name in z.namelist():
+                 if name.startswith('xl/worksheets/sheet') and name.endswith('.xml'):
+                    with z.open(name) as f:
+                        # Chunked reading for memory efficiency
+                        chunk_size = 1024 * 1024 # 1MB
+                        buffer = b''
+                        while True:
+                            chunk = f.read(chunk_size)
+                            if not chunk:
+                                break
+                            buffer += chunk
+
+                            # Find last '>' to split safely
+                            last_tag_end = buffer.rfind(b'>')
+                            if last_tag_end != -1:
+                                to_process = buffer[:last_tag_end+1]
+                                formula_count += len(pattern.findall(to_process))
+                                buffer = buffer[last_tag_end+1:]
+                            else:
+                                # No '>' found, keep accumulating
+                                pass
+
+                        # Process remaining buffer
+                        formula_count += len(pattern.findall(buffer))
+    except Exception as e:
+        sys.stderr.write(f"Error counting formulas via zip: {e}\n")
+        # Return 0 on error, or maybe -1 to indicate failure?
+        # Returning 0 is safer for now as it's just a stat.
+        return 0
+
+    return formula_count
 
 
 def recalc(filename, timeout=30):
@@ -137,20 +185,8 @@ def recalc(filename, timeout=30):
                     'locations': locations[:20]  # Show up to 20 locations
                 }
         
-        # Add formula count for context - also check ALL cells
-        formula_count = 0
-        wb_formulas = load_workbook(filename, data_only=False, read_only=True)
-        try:
-            for sheet_name in wb_formulas.sheetnames:
-                ws = wb_formulas[sheet_name]
-                for row in ws.iter_rows():
-                    for cell in row:
-                        if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
-                            formula_count += 1
-        finally:
-            wb_formulas.close()
-        
-        result['total_formulas'] = formula_count
+        # Add formula count for context - optimized
+        result['total_formulas'] = count_formulas(filename)
         
         return result
         
